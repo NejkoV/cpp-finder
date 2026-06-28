@@ -1,7 +1,7 @@
 import asyncio
 import os
 import smtplib
-from datetime import datetime, timedelta
+from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from playwright.async_api import async_playwright
@@ -17,9 +17,9 @@ POSILJATELJ_EMAIL = "nejkodh@gmail.com"
 GESLO_ZA_APLIKACIJO = "znaz megp qmjj omce"  # Google App Password
 PREJEMNIK_EMAIL = "nejkodh@gmail.com"
 
-MAX_DNI = 200
+# Koliko tednov v prihodnost želiva preiskati (25 tednov je cca. pol leta)
+STEVILO_TEDNOV = 25  
 
-# POPRAVEK: Vsi parametri zbrani tukaj
 IZBRANA_KATEGORIJA = "B"
 IZBRANO_OBMOCJE = "Območje 2"
 IZBRANA_LOKACIJA = "KRANJ Kolodvorska"
@@ -33,7 +33,7 @@ def poslji_email(vsebina_terminov):
     msg["To"] = PREJEMNIK_EMAIL
     msg["Subject"] = "⚠️ OBVESTILO: Najdeni prosti termini za vožnjo (Kranj) ⚠️"
 
-    telo = f"Živijo,\n\nna e-Upravi so se pojavili prosti termini v naslednjih {MAX_DNI} dneh:\n\n"
+    telo = f"Živijo,\n\nna e-Upravi so se pojavili prosti termini v naslednjih {STEVILO_TEDNOV} tednih:\n\n"
     telo += vsebina_terminov
     telo += f"\n\nPovezava do strani: {URL}"
 
@@ -52,7 +52,6 @@ def poslji_email(vsebina_terminov):
 
 async def glavna_skripta():
     async with async_playwright() as p:
-        # headless=True za delo v ozadju
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
             viewport={"width": 1400, "height": 1200},
@@ -63,91 +62,95 @@ async def glavna_skripta():
         print("[1/4] Odpiram spletno stran e-Uprave...")
         await page.goto(URL, wait_until="domcontentloaded", timeout=45000)
         
-        print("[2/4] Nastavljam filtre natančno po elementih...")
+        print("[2/4] Nastavljam filtre (Kategorija, Območje, Kraj)...")
         await page.wait_for_selector("text=PREVERJANJE ZNANJA", timeout=15000)
 
         try:
             # 1. Izbira "Vožnja"
             print(" -> Klikam: Vožnja")
             await page.locator("label:has-text('Vožnja')").first.click(force=True)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(1500)
 
-            # 2. Izbira kategorije (POPRAVEK: Klik neposredno na checkbox preko pripadajočega labela z uporabo force=True)
+            # 2. Izbira kategorije
             print(f" -> Klikam: Kategorija {IZBRANA_KATEGORIJA}")
-            
-            # Najdemo label, ki ima natančno besedilo "B", in kliknemo nanj z možnostjo force=True
             kategorija_label = page.locator(f"//label[normalize-space(text())='{IZBRANA_KATEGORIJA}']").first
             await kategorija_label.click(force=True)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(1500)
 
             # 3. Izbira Območja
             print(" -> Izbiram Območje...")
-            # Kliknemo na polje "Vsa območja"
             await page.locator("//div[contains(text(), 'Vsa območja')] | //span[contains(text(), 'Vsa območja')] | //input[@placeholder='Vsa območja']").first.click(force=True)
             await page.wait_for_timeout(1000)
-            
             await page.keyboard.type(IZBRANO_OBMOCJE)
             await page.wait_for_timeout(500)
             await page.keyboard.press("Enter")
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(1500)
 
             # 4. Izbira Kraja / Lokacije
             print(" -> Izbiram Lokacijo...")
             await page.locator("//div[contains(text(), 'Vse lokacije')] | //span[contains(text(), 'Vse lokacije')] | //input[@placeholder='Vse lokacije']").first.click(force=True)
             await page.wait_for_timeout(1000)
-            
             await page.keyboard.type(IZBRANA_LOKACIJA)
             await page.wait_for_timeout(500)
             await page.keyboard.press("Enter")
+            await page.wait_for_timeout(2000)
 
         except Exception as e:
             print(f"[OPOZORILO] Težava pri vnosu filtrov: {e}")
         
-        # POPRAVEK: Popolnoma izpustiva koledar in pustiva, da JS sam osveži tabelo spodaj
-        print("[3/4] Čakam, da e-Uprava osveži tabelo pod zemljevidom...")
-        await page.wait_for_timeout(6000)
+        print(f"[3/4] Začenjam preklikavanje naslednjih {STEVILO_TEDNOV} tednov...")
+        najdeni_termini = []
 
-        # Kontrolni posnetek - zdaj ko filtri delajo, morava tukaj videti termine!
+        for teden in range(STEVILO_TEDNOV):
+            await page.wait_for_timeout(1500) # Čakamo, da se tabela osveži po kliku
+            
+            # Analiza vrstic za trenutno vidni teden
+            vrstice = await page.locator("table tr, .table tr, div.row").all_inner_texts()
+            
+            for vrstica in vrstice:
+                tekst_clean = vrstica.strip()
+                if not tekst_clean or "Tip / Lokacija" in tekst_clean or "Prosta mesta" in tekst_clean:
+                    continue
+                
+                # POPRAVEK: Namesto filtriranja po besedi "KRANJ", vzamemo vsako vrstico,
+                # ki vsebuje številko (datum/uro) ali besedo "prost", saj so filtri že nastavljeni na Kranj!
+                if any(char.isdigit() for char in tekst_clean) or "PROST" in tekst_clean.upper():
+                    urejen_tekst = " | ".join([delcek.strip() for delcek in tekst_clean.split("\n") if delcek.strip()])
+                    najdeni_termini.append(urejen_tekst)
+            
+            # Klik na gumb "NASLEDNJI TEDEN" za premik naprej
+            try:
+                gumb_naslednji = page.locator("text=NASLEDNJI TEDEN").first
+                if not await gumb_naslednji.is_visible():
+                    gumb_naslednji = page.locator("//div[contains(text(), 'NASLEDNJI TEDEN')] | //span[contains(text(), 'NASLEDNJI TEDEN')] | //a[contains(text(), 'NASLEDNJI TEDEN')]").first
+                
+                if await gumb_naslednji.is_visible():
+                    print(f" -> Pregledan teden {teden + 1}/{STEVILO_TEDNOV}. Klikam 'NASLEDNJI TEDEN'...")
+                    await gumb_naslednji.click(force=True)
+                else:
+                    print(f"[INFO] Gumb 'NASLEDNJI TEDEN' ni več viden. Konec seznama.")
+                    break
+            except Exception as e:
+                print(f"[OPOZORILO] Ni mogoče klikniti gumba za naslednji teden: {e}")
+                break
+
+        # Kontrolni posnetek (shranil bo teden, kjer se je zanka ustavila)
         await page.screenshot(path="končni_pogled_terminov.png", full_page=True)
         print("[INFO] Kontrolni posnetek stanja shranjen v 'končni_pogled_terminov.png'")
 
-        print("[4/4] Analiziram tabelo z rezultati...")
-        
-        najdeni_termini = []
-        
-        # Ker so rezultati v klasični tabeli (kot na tvoji uspešni sliki),
-        # zajamemo vse vrstice 'tr' ali celice 'td' na strani
-        vrstice = await page.locator("table tr, .table tr, div.row").all_inner_texts()
-        
-        print(f"[INFO] Najdeno {len(vrstice)} potencialnih vrstic na strani.")
-
-        for vrstica in vrstice:
-            tekst_clean = vrstica.strip()
-            
-            # Preskočimo prazne vrstice in glavo tabele
-            if not tekst_clean or "Tip / Lokacija" in tekst_clean or "Prosta mesta" in tekst_clean:
-                continue
-                
-            # Če vrstica vsebuje Kranj ali Območje 2, jo vzamemo, saj koledar že sam omeji izpis
-            if "KRANJ" in tekstw_clean.upper() or "OBMOČJE 2" in tekst_clean.upper():
-                # Očistimo morebitne prelomnice vrstic za lepši izpis v mailu
-                urejen_tekst = " | ".join([delcek.strip() for delcek in tekst_clean.split("\n") if delcek.strip()])
-                najdeni_termini.append(urejen_tekst)
-
-        # Odstranimo duplikate
+        print("[4/4] Zaključujem analizo...")
+        # Odstranimo morebitne duplikate
         najdeni_termini = list(set(najdeni_termini))
 
         if najdeni_termini:
-            print(f"[USPEH] Najdenih je {len(najdeni_termini)} terminov v tabeli!")
-            # Izpišemo jih v terminal, da jih takoj vidiš
+            print(f"[USPEH] Skupno najdenih {len(najdeni_termini)} prostih terminov!")
             for t in najdeni_termini:
                 print(f" -> {t}")
                 
             vsebina_za_mail = "\n\n".join(najdeni_termini)
             poslji_email(vsebina_za_mail)
         else:
-            print(f"[-] V tabeli ni bilo najdenih prostih terminov.")
-            print("[NASVET] Poglej sliko 'končni_pogled_terminov.png' - če je tabela spodaj vidna, a je prazna, terminov preprosto ni.")
+            print(f"[-] V celotnem obdobju {STEVILO_TEDNOV} tednov ni bilo najdenih prostih terminov.")
 
         await browser.close()
 
