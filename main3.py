@@ -23,6 +23,7 @@ MAX_DNI = 200
 IZBRANA_KATEGORIJA = "B"
 IZBRANO_OBMOCJE = "Območje 2"
 IZBRANA_LOKACIJA = "KRANJ Kolodvorska"
+STEVILO_TEDNOV = 25
 # =====================================================================
 
 
@@ -102,52 +103,100 @@ async def glavna_skripta():
 
         except Exception as e:
             print(f"[OPOZORILO] Težava pri vnosu filtrov: {e}")
-        
-        # POPRAVEK: Popolnoma izpustiva koledar in pustiva, da JS sam osveži tabelo spodaj
-        print("[3/4] Čakam, da e-Uprava osveži tabelo pod zemljevidom...")
-        await page.wait_for_timeout(6000)
 
-        # Kontrolni posnetek - zdaj ko filtri delajo, morava tukaj videti termine!
-        await page.screenshot(path="končni_pogled_terminov.png", full_page=True)
-        print("[INFO] Kontrolni posnetek stanja shranjen v 'končni_pogled_terminov.png'")
+        print(f"[3/4] Preklapljam skozi {STEVILO_TEDNOV} tednov in zbiram vsebino strani...")
+        vsebina_tednov = []
 
-        print("[4/4] Analiziram tabelo z rezultati...")
-        
-        najdeni_termini = []
-        
-        # Ker so rezultati v klasični tabeli (kot na tvoji uspešni sliki),
-        # zajamemo vse vrstice 'tr' ali celice 'td' na strani
-        vrstice = await page.locator("table tr, .table tr, div.row").all_inner_texts()
-        
-        print(f"[INFO] Najdeno {len(vrstice)} potencialnih vrstic na strani.")
-
-        for vrstica in vrstice:
-            tekst_clean = vrstica.strip()
-            
-            # Preskočimo prazne vrstice in glavo tabele
-            if not tekst_clean or "Tip / Lokacija" in tekst_clean or "Prosta mesta" in tekst_clean:
-                continue
+        for teden in range(STEVILO_TEDNOV):
+            # 1. Počakamo, da se tabela naloži / stabilizira
+            try:
+                tabela_locator = page.locator("#prostiTerminiRezultat table, .table-responsive table").first
+                await tabela_locator.wait_for(state="visible", timeout=5000)
                 
-            # Če vrstica vsebuje Kranj ali Območje 2, jo vzamemo, saj koledar že sam omeji izpis
-            if "KRANJ" in tekst_clean.upper() or "OBMOČJE 2" in tekst_clean.upper():
-                # Očistimo morebitne prelomnice vrstic za lepši izpis v mailu
-                urejen_tekst = " | ".join([delcek.strip() for delcek in tekst_clean.split("\n") if delcek.strip()])
-                najdeni_termini.append(urejen_tekst)
+                # Preberemo tekst celotne tabele
+                trenutna_vsebina = await tabela_locator.inner_text()
+            except Exception:
+                trenutna_vsebina = ""
 
-        # Odstranimo duplikate
+            if trenutna_vsebina and trenutna_vsebina.strip():
+                vsebina_tednov.append(trenutna_vsebina)
+
+            # 2. Klik na gumb "NASLEDNJI TEDEN"
+            try:
+                # E-uprava uporablja puščice, ki imajo pogosto title, class 'next' ali pa specifičen onclick atribut.
+                # Spodnji selektor poskusi najti gumb preko različnih pogostih e-uprava struktur:
+                gumb_naslednji = page.locator(
+                    "a.next, "
+                    "button.next, "
+                    "[title*='Naslednji'], "
+                    "[title*='naslednji'], "
+                    "//a[contains(text(), 'Naslednji')] | //button[contains(text(), 'Naslednji')]"
+                ).first
+
+                if await gumb_naslednji.is_visible():
+                    print(f" -> Teden {teden + 1}/{STEVILO_TEDNOV} zabeležen. Klikam naslednji teden...")
+                    
+                    # Da zagotovimo, da bomo po kliku zaznali spremembo, si lahko shranimo trenutno stanje
+                    star_tekst = trenutna_vsebina
+                    
+                    await gumb_naslednji.click(force=True)
+                    
+                    # Namesto fiksnega timeouta počakamo, da se vsebina tabele spremeni (postane drugačna od stare)
+                    # Če se ne spremeni, počakamo maksimalno 3 sekunde
+                    try:
+                        await page.wait_for_function(
+                            "old => document.querySelector('#prostiTerminiRezultat').innerText !== old",
+                            arg=star_tekst,
+                            timeout=3000
+                        )
+                    except Exception:
+                        # Če se vsebina ni spremenila, je stran morda počasna, zato dodamo krajši fiksen premor
+                        await page.wait_for_timeout(1000)
+                else:
+                    print(f"[INFO] Gumb za naslednji teden ni viden ali ne obstaja. Konec seznama.")
+                    break
+            except Exception as e:
+                print(f"[OPOZORILO] Ni mogoče klikniti gumba za naslednji teden: {e}")
+                break
+
+        # Po koncu preklapljanja obdelamo združene vsebine enkrat
+        print("[INFO] Obdelujem zbrane vsebine (enkrat na koncu)...")
+        najdeni_termini = []
+
+        for blok_tedna in vsebina_tednov:
+            # Vsak teden razbijemo na vrstice
+            for vrstica in blok_tedna.splitlines():
+                tekst_clean = vrstica.strip()
+                
+                # Preskočimo prazne vrstice in glave tabel
+                if not tekst_clean or any(x in tekst_clean for x in ["Tip / Lokacija", "Prosta mesta", "Ni prostih terminov"]):
+                    continue
+                
+                # Preverimo, če vrstica vsebuje KRANJ (iščemo neglede na velike/male črke) in vsaj eno številko (datum/ura)
+                if "KRANJ" in tekst_clean.upper() and any(char.isdigit() for char in tekst_clean):
+                    # Očistimo morebitne odvečne bele znake znotraj vrstice
+                    urejen_tekst = " ".join(tekst_clean.split())
+                    najdeni_termini.append(urejen_tekst)
+
+        # Odstranimo podvojene vrstice
         najdeni_termini = list(set(najdeni_termini))
 
+        # Shranjevanje kontrolne slike
+        try:
+            await page.screenshot(path="končni_pogled_terminov.png", timeout=5000)
+            print("[INFO] Kontrolni posnetek stanja shranjen v 'končni_pogled_terminov.png'")
+        except Exception as e:
+            print(f"[OPOZORILO] Ni bilo mogoče narediti posnetka zaslona: {e}")
+
+        # Zaključek in pošiljanje obvestila
+        print("[4/4] Zaključujem analizo...")
+
         if najdeni_termini:
-            print(f"[USPEH] Najdenih je {len(najdeni_termini)} terminov v tabeli!")
-            # Izpišemo jih v terminal, da jih takoj vidiš
-            for t in najdeni_termini:
-                print(f" -> {t}")
-                
-            vsebina_za_mail = "\n\n".join(najdeni_termini)
+            print(f"[USPEH] Skupno najdenih {len(najdeni_termini)} prostih terminov za Kranj!")
+            vsebina_za_mail = "\n".join(najdeni_termini)
             poslji_email(vsebina_za_mail)
         else:
-            print(f"[-] V tabeli ni bilo najdenih prostih terminov.")
-            print("[NASVET] Poglej sliko 'končni_pogled_terminov.png' - če je tabela spodaj vidna, a je prazna, terminov preprosto ni.")
+            print(f"[-] V celotnem obdobju {STEVILO_TEDNOV} tednov ni bilo najdenih prostih terminov za Kranj.")
 
         await browser.close()
 
